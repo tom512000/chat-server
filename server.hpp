@@ -21,7 +21,7 @@ class Server
         asio::streambuf m_buffer;
         std::string m_alias;
         bool m_active;
-        
+
       public:
         Client (Server *, Socket &&);
         void start ();
@@ -184,8 +184,14 @@ void Server::start ()
 
 Server::ClientPtr Server::find (const std::string & alias)
 {
-  // TODO
-  return nullptr;
+for (auto const &client : m_clients)
+{
+  if(client->alias()==alias)
+  {
+    return client;
+  }
+}
+return nullptr;
 }
 
 void Server::accept ()
@@ -253,4 +259,3 @@ const std::string Server::INVALID_ALIAS     {"#error invalid_alias"};
 const std::string Server::INVALID_COMMAND   {"#error invalid_command"};
 const std::string Server::INVALID_RECIPIENT {"#error invalid_recipient"};
 const std::string Server::MISSING_ARGUMENT  {"#error missing_argument"};
-
