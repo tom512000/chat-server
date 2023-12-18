@@ -2,6 +2,7 @@
 #include <map>
 #include <iostream>
 #include <asio.hpp>
+#include <regex>
 
 ////////////////////////////////////////////////////////////////////////////////
 // Server //////////////////////////////////////////////////////////////////////
@@ -51,20 +52,16 @@ class Server
     ClientPtr find (const std::string & alias);
     // Traitement d'une commande.
     void process (ClientPtr, const std::string &);
-
-    void process_alias(ClientPtr client, const std::string &data);
-    void process_connected(ClientPtr client, const std::string &data);
-    void process_disconnected(ClientPtr client, const std::string &data);
-    void process_renamed(ClientPtr client, const std::string &data);
-    void process_private(ClientPtr client, const std::string &data);
-
-
+    // Traitement de la commande quit.
+    void process_quit (ClientPtr client, const std::string &);
+    // Traitement de la commande list.
+    void process_list (ClientPtr client, const std::string & = "");
+    // Traitement de la commande private.
+    void process_private (ClientPtr client, const std::string & = "");
+    // Traitement de la commande alias.
+    void process_alias(ClientPtr client, const std::string &);
     // Processeurs.
     void process_message (ClientPtr, const std::string &);
-
-    void process_list(ClientPtr, const std::string &);
-
-    void process_quit(ClientPtr client, const std::string &data);
     // Diffusion d'un message.
     void broadcast (const std::string & message, ClientPtr emitter = nullptr);
     // Suppression d'un client.
@@ -95,65 +92,39 @@ Server::Client::Client (Server * server, Socket && socket) :
   std::cout << "Nouveau client !" << std::endl;
 }
 
-void Server::Client::start()
+void Server::Client::start ()
 {
-  if (m_active)
-    return;
+  if (m_active) return;
 
   // Pointeur intelligent pour assurer la survie de l'objet.
-  ClientPtr self = shared_from_this();
+  ClientPtr self = shared_from_this ();
 
-  // Receive and process alias asynchronously.
-  async_read_until(m_socket, m_buffer, '\n', [this, self](const std::error_code &ec, std::size_t n) {
-    // Erreur ?
-    if (!ec)
-    {
-      std::istream is{&m_buffer};
-      std::string alias;
-      is >> alias;
-
-      // Validate the alias (you may need to implement this logic)
-      if (!alias.empty())
-      {
-        // Set the alias for the client
-        m_alias = alias;
-
-        // Send the alias validation message
-        write("#alias " + alias);
-
-        // Prepare the list of connected users
-        std::string userListMessage = "#list";
-        for (const auto &otherClient : m_server->m_clients)
-        {
-          if (otherClient != self)
-          {
-            userListMessage += " " + otherClient->alias();
-          }
+  // Lecture asynchrone.
+  async_read_until (m_socket, m_buffer, '\n',
+    [this, self] (const std::error_code & ec, std::size_t n) {
+      // Erreur ?
+      if (! ec) {
+        std::istream is {&m_buffer};
+        std::string alias;
+        std::getline (is, alias, ' ');
+        alias = std::regex_replace(alias, std::regex("\\s"), "");
+        if(m_server->find(alias) == nullptr) {
+          self->m_alias = alias;
+          self->write("#alias " + alias);
+          m_server->process_list(self);
+          m_server->broadcast("#connected " + alias, self);
+          self->m_active = true;
+          self->read();
         }
-
-        // Send the list of connected users to the client
-        write(userListMessage);
-
-        // Notify all users about the new connection
-        std::string connectedMessage = "#connected " + alias;
-        m_server->broadcast(connectedMessage, self);
-
-        // Start reading for the next command
-        read();
+        else
+          self->write(Server::INVALID_ALIAS);
       }
       else
       {
-        // Handle invalid alias
-        write(Server::INVALID_ALIAS);
-        stop();
+        std::cout << "Bonjour, au revoir !" << std::endl;
+        m_server->m_clients.remove (self);
       }
-    }
-    else
-    {
-      // Handle read error or client disconnection
-      m_server->remove(self);
-    }
-  });
+    });
 }
 
 void Server::Client::stop ()
@@ -195,6 +166,8 @@ void Server::Client::read ()
       else
       {
         std::cout << "Déconnexion intempestive !" << std::endl;
+        m_server->broadcast("#disconnected " + self->alias(), self);
+        m_server->m_clients.remove (self);
         m_server->process_quit (self, std::string {});
       }
     });
@@ -232,11 +205,11 @@ void Server::start ()
   m_context.run ();
 }
 
-Server::ClientPtr Server::find(const std::string &alias)
+Server::ClientPtr Server::find (const std::string & alias)
 {
-  for (const auto &client : m_clients)
+  for (ClientPtr client: this->m_clients)
   {
-    if (client->alias() == alias)
+    if(client->alias() == alias)
     {
       return client;
     }
@@ -245,12 +218,12 @@ Server::ClientPtr Server::find(const std::string &alias)
   return nullptr;
 }
 
-
 void Server::accept ()
 {
   m_acceptor.async_accept (
     [this] (const std::error_code & ec, Socket && socket)
     {
+      // Erreur ?
       if (! ec)
       {
         m_clients.emplace_back (std::make_shared<Client> (this, std::move (socket)));
@@ -261,136 +234,97 @@ void Server::accept ()
     });
 }
 
-void Server::process(ClientPtr client, const std::string &message)
+void Server::process (ClientPtr client, const std::string & message)
 {
-  std::istringstream iss(message);
+  // Lecture d'une éventuelle commande.
+  std::istringstream iss (message);
   std::string command;
   if (iss >> command)
   {
+    // Commande ?
     if (command[0] == '/')
     {
-      command.erase(0, 1);
-
+      // Consommation des caractères blancs.
       iss >> std::ws;
+      // Reste du message.
+      std::string data {std::istreambuf_iterator<char> {iss}, std::istreambuf_iterator<char> {}};
 
-      std::string data{std::istreambuf_iterator<char>{iss}, std::istreambuf_iterator<char>{}};
-
-      auto processorIt = PROCESSORS.find(command);
-      if (processorIt != PROCESSORS.end())
+      // Recherche du processeur correspondant.
+      // - S'il existe, l'appeler ;
+      // - Sinon, "#invalid_command" !
+      auto search = PROCESSORS.find(command);
+      if(search != PROCESSORS.end())
       {
-        Processor processor = processorIt->second;
-        (this->*processor)(client, data);
+        Server::Processor proc = search->second;
+
+        (this->*proc)(client, data);
       }
-      else
-      {
-        process_message(client, "Unknown command: " + command);
+      else {
+        client->write(Server::INVALID_COMMAND);
       }
     }
     else
-    {
-      process_message(client, message);
-    }
+      process_message (client, message);
   }
 }
 
-void Server::process_alias(ClientPtr client, const std::string &data)
-{
-    std::istringstream iss(data);
-    std::string command, alias;
-    iss >> command >> alias;
-    client->rename(alias);
+void Server::process_private(ClientPtr client, const std::string & data) {
+  int delimiterPosition = data.find(' ');
+  std::string recipientName = data.substr(0, delimiterPosition);
+  std::string message = data.substr(delimiterPosition + 1, data.length() - 1);
+
+  ClientPtr recipientClient = find(recipientName);
+  if(recipientClient != nullptr)
+  {
+    recipientClient->write("#private " + client->alias() + " " + message);
+  }
 }
 
-void Server::process_connected(ClientPtr client, const std::string &data)
+void Server::process_list (ClientPtr client, const std::string & data)
 {
-    broadcast("#connected " + client->alias(), client);
-}
-
-void Server::process_disconnected(ClientPtr client, const std::string &data)
-{
-    remove(client);
-    broadcast("#disconnected " + client->alias(), client);
-}
-
-void Server::process_renamed(ClientPtr client, const std::string &data)
-{
-    std::istringstream iss(data);
-    std::string command, oldName, newName;
-    iss >> command >> oldName >> newName;
-    broadcast("#renamed " + oldName + " " + newName, client);
-}
-
-
-void Server::process_private(ClientPtr client, const std::string &data)
-{
-    std::istringstream iss(data);
-    std::string command, recipient, message;
-    iss >> command >> recipient;
-    std::getline(iss, message);
-
-    auto recipientClient = find(recipient);
-    if (recipientClient)
-    {
-        recipientClient->write("#private " + client->alias() + " " + message);
-    }
-    else
-    {
-        client->write("#error recipient_not_found");
-    }
+  std::string m = "#list ";
+  for (ClientPtr client: m_clients)
+  {
+    m += client->alias() + " ";
+    std::cout << "-> [" << client->alias() << "]" << std::endl;
+  }
+  m.pop_back();
+  client->write(m);
 }
 
 
 void Server::process_message (ClientPtr client, const std::string & data)
 {
-  std::string m = "<b>" + client->alias () + "</b> : " + data;
+  std::string m = "<b>" + client->alias() + "</b> : " + data;
   broadcast (m);
 }
 
-void Server::process_list(ClientPtr client, const std::string &data)
+void Server::process_quit (ClientPtr client, const std::string & data)
 {
-  std::string userListMessage = "#list";
-  for (const auto &otherClient : m_clients)
-  {
-    if (otherClient != client)
-    {
-      userListMessage += " " + otherClient->alias();
+    m_clients.remove (client);
+    client->stop();
+}
+
+void Server::process_alias(ClientPtr client, const std::string &data)
+{
+  std::string newAlias = data;
+  client->rename(newAlias);
+}
+
+void Server::broadcast (const std::string & message, ClientPtr emitter)
+{
+    std::string m = message + '\n';
+    for (ClientPtr client: this->m_clients) {
+      if (client != emitter)
+        client->write(message);
     }
-  }
-
-  client->write(userListMessage);
 }
-
-
-
-void Server::process_quit(ClientPtr client, const std::string &)
-{
-  std::cout << "Client " << client->alias() << " has quit." << std::endl;
-  broadcast("<b>" + client->alias() + " has quit.</b>", client);
-  remove(client);
-}
-
-
-void Server::broadcast(const std::string &message, ClientPtr emitter)
-{
-  for (const auto &client : m_clients)
-  {
-    if (client != emitter)
-    {
-      client->write(message);
-    }
-  }
-}
-
-void Server::remove(ClientPtr client)
-{
-  m_clients.remove(client);
-  client->stop();
-  std::cout << "Client " << client->alias() << " removed." << std::endl;
-}
-
 
 const std::map<std::string, Server::Processor> Server::PROCESSORS {
-  {"/quit", &Server::process_quit}
+  {"/quit", &Server::process_quit},
+  {"/list", &Server::process_list},
+  {"/private", &Server::process_private},
+  {"/alias", &Server::process_alias}
 };
 
 const std::string Server::INVALID_ALIAS     {"#error invalid_alias"};
